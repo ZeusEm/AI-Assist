@@ -1,2 +1,2 @@
 # AI-Assist
-Personal offline AI Assistance with Document Support
+Personal offline AI Assistant with Document Support
