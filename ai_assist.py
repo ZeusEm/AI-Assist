@@ -5,177 +5,157 @@ AI Assist - v0.1 dated 14-12-2024
 """
 
 import os
-import sqlite3
 import pickle
+import logging
+import faiss
 from transformers import pipeline
 from sentence_transformers import SentenceTransformer
 import pdfplumber
 from docx import Document
-import pytesseract
-from PIL import Image
-from scipy.spatial.distance import cosine
+from tqdm import tqdm
 
-# Set pytesseract path (modify this to your Tesseract installation path)
-pytesseract.pytesseract.tesseract_cmd = r"C:\\Users\\Shubham Mehta\\AppData\\Local\\Programs\\Tesseract-OCR\\tesseract.exe"
+# Initialize logging
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Initialize models
-qa_pipeline = pipeline("question-answering", model="deepset/roberta-base-squad2")
-embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+# Models for QA and Summarization
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+qa_pipeline = pipeline("text2text-generation", model="google/flan-t5-large")
+summarizer_pipeline = pipeline("summarization", model="facebook/bart-large-cnn")
 
-# Database setup
-def init_db():
-    conn = sqlite3.connect('ai_assist.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS documents (
-                    id INTEGER PRIMARY KEY,
-                    file_name TEXT,
-                    chunk_id INTEGER,
-                    content TEXT,
-                    embedding BLOB
-                )''')
-    conn.commit()
-    conn.close()
+# FAISS Index and Document Store
+index = None
+doc_store = {}
+trained_files = set()  # Store file names for listing
 
-# Split text into chunks
-def split_into_chunks(text, max_chunk_size=300):
-    words = text.split()
-    chunks = []
-    for i in range(0, len(words), max_chunk_size):
-        chunk = ' '.join(words[i:i + max_chunk_size])
-        chunks.append(chunk)
-    return chunks
+# Initialize FAISS
+def initialize_faiss():
+    global index
+    d = embedding_model.get_sentence_embedding_dimension()
+    index = faiss.IndexFlatL2(d)
 
-# Store text and embeddings in database
-def store_text(file_name, text):
-    chunks = split_into_chunks(text)
+# Add documents to FAISS
+def add_to_index(file_name, chunks):
+    global doc_store
     for idx, chunk in enumerate(chunks):
         embedding = embedding_model.encode(chunk)
-        conn = sqlite3.connect('ai_assist.db')
-        c = conn.cursor()
-        c.execute('INSERT INTO documents (file_name, chunk_id, content, embedding) VALUES (?, ?, ?, ?)',
-                  (file_name, idx, chunk, pickle.dumps(embedding)))
-        conn.commit()
-        conn.close()
+        index.add(embedding.reshape(1, -1))
+        doc_store[len(doc_store)] = {"file_name": file_name, "chunk": chunk}
+    trained_files.add(file_name)
 
-# Search for the most relevant text based on a query
-def search_query(query, top_n=3):
-    query_embedding = embedding_model.encode(query)
-    conn = sqlite3.connect('ai_assist.db')
-    c = conn.cursor()
-    c.execute('SELECT content, embedding FROM documents')
-    rows = c.fetchall()
-    
-    results = []
-    for content, embedding_blob in rows:
-        embeddings = pickle.loads(embedding_blob)
-        similarity = 1 - cosine(embeddings, query_embedding)
-        results.append((similarity, content))
-    
-    conn.close()
+# Preprocessing: Chunk text with overlap
+def split_into_chunks(text, max_chunk_size=300, overlap=50):
+    words = text.split()
+    chunks = []
+    for i in range(0, len(words), max_chunk_size - overlap):
+        chunks.append(" ".join(words[i:i + max_chunk_size]))
+    return chunks
 
-    # Sort results by similarity score in descending order
-    results.sort(reverse=True, key=lambda x: x[0])
-    
-    # Aggregate top N results
-    top_contexts = [res[1] for res in results[:top_n]]
-    return ' '.join(top_contexts)
-
-# Answer a question based on context
-def answer_question(context, question):
-    if not context.strip():
-        return "I couldn't find relevant information."
-    try:
-        response = qa_pipeline(question=question, context=context)
-        return response['answer']
-    except Exception as e:
-        return f"An error occurred: {str(e)}"
-
-# Extract text from PDF
+# Process files
 def extract_text_from_pdf(file_path):
-    try:
-        text = ''
-        with pdfplumber.open(file_path) as pdf:
-            for page in pdf.pages:
-                text += page.extract_text() or ''
-        return text
-    except Exception as e:
-        print(f"Error processing PDF {file_path}: {e}")
-        return ''
+    with pdfplumber.open(file_path) as pdf:
+        return "".join([page.extract_text() for page in pdf.pages if page.extract_text()])
 
-# Extract text from DOCX
 def extract_text_from_docx(file_path):
-    try:
-        doc = Document(file_path)
-        text = '\n'.join([para.text for para in doc.paragraphs])
-        return text
-    except Exception as e:
-        print(f"Error processing DOCX {file_path}: {e}")
-        return ''
+    doc = Document(file_path)
+    return "\n".join([para.text for para in doc.paragraphs])
 
-# Extract text from images (optional)
-def extract_text_from_image(file_path):
-    try:
-        image = Image.open(file_path)
-        text = pytesseract.image_to_string(image)
-        return text
-    except Exception as e:
-        print(f"Error processing image {file_path}: {e}")
-        return ''
-
-# Process a single file
 def process_file(file_path):
-    file_name = os.path.basename(file_path)
+    text = ""
     if file_path.endswith(".pdf"):
         text = extract_text_from_pdf(file_path)
     elif file_path.endswith(".docx"):
         text = extract_text_from_docx(file_path)
-    elif file_path.endswith((".jpg", ".png")):
-        text = extract_text_from_image(file_path)
     else:
-        print(f"Unsupported file format for {file_path}! Skipping.")
+        logging.warning(f"Unsupported file format: {file_path}")
         return
+    chunks = split_into_chunks(text)
+    add_to_index(os.path.basename(file_path), chunks)
 
-    print(f"Processed file: {file_path}")
-    store_text(file_name, text)
+# Search in FAISS
+def search_faiss(query, top_k=5):
+    query_embedding = embedding_model.encode(query).reshape(1, -1)
+    distances, indices = index.search(query_embedding, top_k)
+    results = []
+    for dist, idx in zip(distances[0], indices[0]):
+        if idx == -1:
+            continue
+        results.append(doc_store[idx]["chunk"])
+    return results
 
-# Process a folder of files
-def process_folder(folder_path):
-    for root, _, files in os.walk(folder_path):
-        for file in files:
-            process_file(os.path.join(root, file))
+# Summarize retrieved context
+def summarize_context(contexts, max_length=512):
+    summarized_chunks = []
+    for i in range(0, len(contexts), 3):  # Process in batches of 3 chunks
+        batch = " ".join(contexts[i:i + 3])
+        try:
+            summary = summarizer_pipeline(batch, max_length=max_length, truncation=True)
+            summarized_chunks.append(summary[0]["summary_text"])
+        except Exception as e:
+            logging.error(f"Summarization failed: {e}")
+    return " ".join(summarized_chunks)
+
+# Answer questions with enhanced QA
+def answer_question(query):
+    results = search_faiss(query, top_k=10)  # Retrieve more chunks
+    if not results:
+        return "No relevant context found for your query."
+    
+    # Rank contexts by similarity and aggregate top ones
+    ranked_contexts = [res for res in results]
+    
+    # Summarize retrieved contexts
+    try:
+        summarized_context = summarize_context(ranked_contexts[:5])  # Use top 5 chunks for summarization
+        logging.info(f"Summarized context: {summarized_context}")
+        answer = qa_pipeline(f"Question: {query} Context: {summarized_context}", max_length=512, truncation=True)
+        return f"{answer[0]['generated_text']}\n\n[Summary of Context]\n{summarized_context}"
+    except Exception as e:
+        logging.error(f"QA or Summarization failed: {e}")
+        return "An error occurred while generating the answer."
+
+# View trained documents
+def list_trained_documents():
+    if trained_files:
+        print("Trained Documents:")
+        for file in trained_files:
+            print(f"- {file}")
+    else:
+        print("No documents have been trained yet.")
 
 # Interactive menu
 def interactive_menu():
+    initialize_faiss()
     while True:
-        print("Welcome to the Personal AI Assistant!")
+        print("\nWelcome to the Personal AI Assistant!")
         print("1. Train the system with documents")
         print("2. Query the system")
-        print("3. Exit")
+        print("3. List trained documents")
+        print("4. Exit")
+        choice = input("Enter your choice (1/2/3/4): ").strip()
 
-        choice = input("Enter your choice (1/2/3): ").strip()
-        
         if choice == "1":
-            folder_path = input("Enter the folder path: ").strip()
-            if os.path.isdir(folder_path):
-                process_folder(folder_path)
+            folder = input("Enter the folder path: ").strip()
+            if os.path.isdir(folder):
+                print("Processing documents...")
+                for root, _, files in os.walk(folder):
+                    for file in tqdm(files, desc="Training files", unit="file"):
+                        process_file(os.path.join(root, file))
                 print("Training completed.")
             else:
                 print("Invalid folder path.")
         elif choice == "2":
             query = input("Enter your query: ").strip()
-            context = search_query(query)
-            answer = answer_question(context, query)
-            print(f"Answer: {answer}")
+            print("Processing query...")
+            answer = answer_question(query)
+            print(f"Answer:\n{answer}")
         elif choice == "3":
+            list_trained_documents()
+        elif choice == "4":
             print("Goodbye!")
             break
         else:
             print("Invalid choice.")
 
 # Main function
-def main():
-    init_db()
-    interactive_menu()
-
 if __name__ == "__main__":
-    main()
+    interactive_menu()
