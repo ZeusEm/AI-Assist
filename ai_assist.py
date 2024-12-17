@@ -5,27 +5,29 @@ AI Assist - v0.1 dated 14-12-2024
 """
 
 import os
-import pickle
+import subprocess
 import logging
-import faiss
-from transformers import pipeline
 from sentence_transformers import SentenceTransformer
 import pdfplumber
 from docx import Document
 from tqdm import tqdm
+import pickle
+import faiss
 
 # Initialize logging
-logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Models for QA and Summarization
+# Embedding model
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-qa_pipeline = pipeline("text2text-generation", model="google/flan-t5-large")
-summarizer_pipeline = pipeline("summarization", model="facebook/bart-large-cnn")
 
 # FAISS Index and Document Store
 index = None
 doc_store = {}
-trained_files = set()  # Store file names for listing
+trained_files = set()
+
+# Paths for llama.cpp and model
+LLAMA_CLI_PATH = r"D:\Projects\Chatbot\llama.cpp\bin\Release\llama-cli.exe"
+MODEL_PATH = r"D:\Projects\Chatbot\llama.cpp\models\gemma-1.1-2b-it.Q3_K_M.gguf"
 
 # Initialize FAISS
 def initialize_faiss():
@@ -42,7 +44,7 @@ def add_to_index(file_name, chunks):
         doc_store[len(doc_store)] = {"file_name": file_name, "chunk": chunk}
     trained_files.add(file_name)
 
-# Preprocessing: Chunk text with overlap
+# Split text into chunks
 def split_into_chunks(text, max_chunk_size=300, overlap=50):
     words = text.split()
     chunks = []
@@ -50,15 +52,17 @@ def split_into_chunks(text, max_chunk_size=300, overlap=50):
         chunks.append(" ".join(words[i:i + max_chunk_size]))
     return chunks
 
-# Process files
+# Extract text from PDF
 def extract_text_from_pdf(file_path):
     with pdfplumber.open(file_path) as pdf:
         return "".join([page.extract_text() for page in pdf.pages if page.extract_text()])
 
+# Extract text from DOCX
 def extract_text_from_docx(file_path):
     doc = Document(file_path)
     return "\n".join([para.text for para in doc.paragraphs])
 
+# Process file
 def process_file(file_path):
     text = ""
     if file_path.endswith(".pdf"):
@@ -71,8 +75,8 @@ def process_file(file_path):
     chunks = split_into_chunks(text)
     add_to_index(os.path.basename(file_path), chunks)
 
-# Search in FAISS
-def search_faiss(query, top_k=5):
+# Search FAISS for relevant context
+def search_faiss(query, top_k=3):
     query_embedding = embedding_model.encode(query).reshape(1, -1)
     distances, indices = index.search(query_embedding, top_k)
     results = []
@@ -80,43 +84,39 @@ def search_faiss(query, top_k=5):
         if idx == -1:
             continue
         results.append(doc_store[idx]["chunk"])
-    return results
+    return " ".join(results)
 
-# Summarize retrieved context
-def summarize_context(contexts, max_length=512):
-    summarized_chunks = []
-    for i in range(0, len(contexts), 3):  # Process in batches of 3 chunks
-        batch = " ".join(contexts[i:i + 3])
-        try:
-            summary = summarizer_pipeline(batch, max_length=max_length, truncation=True)
-            summarized_chunks.append(summary[0]["summary_text"])
-        except Exception as e:
-            logging.error(f"Summarization failed: {e}")
-    return " ".join(summarized_chunks)
-
-# Answer questions with enhanced QA
-def answer_question(query):
-    results = search_faiss(query, top_k=10)  # Retrieve more chunks
-    if not results:
-        return "No relevant context found for your query."
-    
-    # Rank contexts by similarity and aggregate top ones
-    ranked_contexts = [res for res in results]
-    
-    # Summarize retrieved contexts
+# Query llama.cpp
+def query_llama_cpp(prompt, n_predict=50):
     try:
-        summarized_context = summarize_context(ranked_contexts[:5])  # Use top 5 chunks for summarization
-        logging.info(f"Summarized context: {summarized_context}")
-        answer = qa_pipeline(f"Question: {query} Context: {summarized_context}", max_length=512, truncation=True)
-        return f"{answer[0]['generated_text']}\n\n[Summary of Context]\n{summarized_context}"
-    except Exception as e:
-        logging.error(f"QA or Summarization failed: {e}")
-        return "An error occurred while generating the answer."
+        cmd = [
+            LLAMA_CLI_PATH,
+            "--model", MODEL_PATH,
+            "--prompt", prompt,
+            "--n-predict", str(n_predict)
+        ]
+        # Run the llama-cli executable and capture the output
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        output = result.stdout.strip()
+        return output
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error querying llama.cpp: {e}")
+        return "An error occurred while generating the response."
 
-# View trained documents
+# Answer a question
+def answer_question(query):
+    context = search_faiss(query)
+    if not context:
+        return "No relevant context found for your query."
+    logging.info("Context retrieved successfully.")
+    full_prompt = f"Context: {context}\n\nQuestion: {query}\nAnswer:"
+    response = query_llama_cpp(full_prompt, n_predict=100)
+    return response
+
+# List trained documents
 def list_trained_documents():
     if trained_files:
-        print("Trained Documents:")
+        print("\nTrained Documents:")
         for file in trained_files:
             print(f"- {file}")
     else:
