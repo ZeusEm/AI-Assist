@@ -1,4 +1,4 @@
-#AI Assist - Comprehensive Documentation 🧠🤖
+AI Assist - Comprehensive Documentation 🧠🤖
 =======================================
 
 Welcome to the documentation for **AI Assist**, a sophisticated Python-based chatbot that leverages the power of natural language processing and machine learning to provide insightful and contextually aware responses. This document will guide you through the process of setting up, using, and understanding the repository.
